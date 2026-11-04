@@ -160,7 +160,10 @@ const layer = Layer.effect(
           Effect.die(new UpstreamDivergedError({ sessionID, detail: `undecodable log frame: ${data.slice(0, 180)}` })),
         ),
       )
-      if (frame.type === "log.synced") return
+      // The watermark marker carries no durable envelope; only real events are
+      // replayed. `in` narrowing is used because the event `type` is a wide
+      // string, so a literal comparison would not narrow the union.
+      if (!("durable" in frame)) return
       // The log endpoint is keyed by session; a foreign aggregate would map the
       // upstream transcript onto the wrong local session, so refuse it loudly.
       if (frame.durable.aggregateID !== sessionID) {
@@ -242,18 +245,19 @@ const layer = Layer.effect(
     yield* Effect.logInfo(`UpstreamSync: following upstream ${config.url} as ${ownerID}`)
 
     return Service.of({
-      status: Effect.gen(function* () {
-        const entries = yield* Effect.forEach(
-          Array.from(tailed.entries()),
-          ([sessionID, entry]) =>
-            Effect.gen(function* () {
-              const cursor = yield* latestSequence(db, sessionID)
-              return { sessionID, cursor, state: entry.state }
-            }),
-          { concurrency: 1 },
-        )
-        return { enabled: true, peerID: config.peerID, tailed: entries } satisfies Status
-      }),
+      status: () =>
+        Effect.gen(function* () {
+          const entries = yield* Effect.forEach(
+            Array.from(tailed.entries()),
+            ([sessionID, entry]) =>
+              Effect.gen(function* () {
+                const cursor = yield* latestSequence(db, sessionID)
+                return { sessionID, cursor, state: entry.state }
+              }),
+            { concurrency: 1 },
+          )
+          return { enabled: true, peerID: config.peerID, tailed: entries } satisfies Status
+        }),
     })
   }),
 )
