@@ -114,7 +114,7 @@ const layer = Layer.effect(
     }
 
     const bus = yield* Bus.Service
-    const db = yield* Database.Service
+    const { db } = yield* Database.Service
     const http = yield* HttpClient.HttpClient
     const ownerID = `peer:${config.peerID}`
     const tailed = new Map<string, TailedSession>()
