@@ -1,7 +1,7 @@
 export * as UpstreamSync from "./upstream.js"
 
-import { HttpClient, HttpClientRequest } from "effect/http"
-import { Context, Effect, Fiber, Layer, Schedule, Schema, Stream } from "effect"
+import { HttpClient, HttpClientRequest, HttpClientResponse } from "effect/http"
+import { Cause, Context, Effect, Fiber, Layer, Option, Schedule, Schema, Stream } from "effect"
 import { Event } from "@opencode/schema/event"
 import { makeGlobalNode } from "@opencode/util/effect/app-node"
 import { httpClient } from "@opencode/util/effect/app-node-platform"
@@ -130,16 +130,15 @@ const layer = Layer.effect(
       if (response.status === 401 || response.status === 403) {
         return yield* new UpstreamAuthError({ status: response.status })
       }
-      const body = yield* response.json
-      const decoded = yield* Schema.decodeUnknownEffect(
+      const decoded = yield* HttpClientResponse.schemaBodyJson(
         Schema.Struct({ data: Schema.Array(Schema.Struct({ id: Schema.String })) }),
-      )(body)
+      )(response)
       return decoded.data.map((item) => item.id)
     })
 
     const replayFrame = Effect.fn("UpstreamSync.replayFrame")(function* (sessionID: string, data: string) {
       const synced = Schema.decodeUnknownOption(WireSynced)(data)
-      if (synced._tag === "Some") return
+      if (Option.isSome(synced)) return
       const event = yield* Schema.decodeUnknownEffect(WireEvent)(data).pipe(
         Effect.catchAll(() => Effect.die(`UpstreamSync: undecodable log frame for ${sessionID}`)),
       )
@@ -165,7 +164,10 @@ const layer = Layer.effect(
         )
         .pipe(
           Effect.catchAllCause((cause) => {
-            const detail = String(cause.defects.map((defect) => (defect instanceof Error ? defect.message : defect)).join("; "))
+            const detail = cause.reasons
+              .filter(Cause.isDieReason)
+              .map((reason) => (reason.defect instanceof Error ? reason.defect.message : String(reason.defect)))
+              .join("; ")
             // A local replica that diverged or was claimed by another owner must
             // stop following; silently skipping would corrupt the transcript.
             if (detail.includes("diverged") || detail.includes("owner mismatch")) {
@@ -191,7 +193,10 @@ const layer = Layer.effect(
     const tailForever = (sessionID: string) =>
       tailOnce(sessionID).pipe(
         Effect.catchAllCause((cause) => {
-          const diverged = cause.defects.find((defect) => defect instanceof UpstreamDivergedError)
+          const diverged = cause.reasons
+            .filter(Cause.isDieReason)
+            .map((reason) => reason.defect)
+            .find((defect) => defect instanceof UpstreamDivergedError)
           if (diverged instanceof UpstreamDivergedError) {
             const entry = tailed.get(sessionID)
             if (entry) {
