@@ -1,0 +1,46 @@
+name: fork-build
+
+# AOpenCode fork pipeline: typecheck the sync module and produce the
+# linux-arm64-musl binary that the Android app bundles.
+
+on:
+  push:
+    branches: [upstream-sync]
+  workflow_dispatch:
+
+concurrency:
+  group: fork-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  typecheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.4
+      - run: bun install --frozen-lockfile
+      - name: Typecheck core
+        run: bun run typecheck
+        working-directory: packages/core
+      - name: Typecheck server
+        run: bun run typecheck
+        working-directory: packages/server
+
+  binary:
+    needs: typecheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.4
+      - run: bun install --frozen-lockfile
+      - name: Build linux-arm64-musl
+        run: OPENCODE_TARGET=linux-arm64-musl bun run build
+        working-directory: packages/cli
+      - uses: actions/upload-artifact@v4
+        with:
+          name: opencode-linux-arm64-musl
+          path: packages/cli/dist/cli-linux-arm64-musl/bin/opencode
