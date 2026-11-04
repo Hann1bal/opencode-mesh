@@ -1,19 +1,25 @@
 export * as UpstreamSync from "./upstream.js"
 
 import { HttpClient, HttpClientRequest, HttpClientResponse } from "effect/http"
-import { Cause, Context, Effect, Fiber, Layer, Option, Schedule, Schema, Stream } from "effect"
+import { Context, Effect, Layer, Schedule, Schema, Stream } from "effect"
 import { Event } from "@opencode/schema/event"
 import { makeGlobalNode } from "@opencode/util/effect/app-node"
 import { httpClient } from "@opencode/util/effect/app-node-platform"
-import { Bus, latestSequence } from "../bus.js"
+import { Bus, InvalidDurableEventError, latestSequence } from "../bus.js"
 import { Database } from "../database/database.js"
 
 /**
- * Live session sharing: this process tails the durable event log of another
- * OpenCode server (the upstream) and replays every event into the local bus with
- * `ownerID = peer:<id>`. The local projections materialize upstream sessions as
- * read-only replicas that stream live through the local `/event` SSE feed, so a
+ * Live session sharing.
+ *
+ * This process tails the durable event log of another OpenCode server (the
+ * upstream, typically the home machine) and replays every event into the local
+ * bus under `ownerID = peer:<id>`. Local projections materialize the upstream
+ * sessions as replicas that stream live through the local `/event` feed, so a
  * single GUI can follow sessions owned by many servers.
+ *
+ * The tail is read-only: replayed aggregates stay owned by the peer, so a local
+ * write to a replica is rejected by `strictOwner` instead of silently
+ * diverging from the upstream transcript.
  *
  * Disabled unless `OPENCODE_UPSTREAM_URL` and `OPENCODE_UPSTREAM_TOKEN` are set.
  */
@@ -35,7 +41,6 @@ export class UpstreamDivergedError extends Schema.TaggedError<UpstreamDivergedEr
 }) {}
 
 interface TailedSession {
-  readonly fiber: Fiber.Fiber<never, void>
   state: "following" | "conflicted"
   detail?: string
 }
@@ -71,11 +76,14 @@ function readConfig(env: Record<string, string | undefined>): Config | undefined
   }
 }
 
-// Wire shape of a durable event as streamed by the upstream session log.
+// Mirrors the session log SSE contract, `Schema.Union([SessionEvent.Durable,
+// EventLog.Synced])`, decoded loosely so fields a newer upstream adds do not
+// break the tail. The marker is listed first: its literal type keeps the two
+// members disjoint under `oneOf`.
 const WireEvent = Schema.Struct({
   id: Schema.String,
   type: Schema.String,
-  created: Schema.optional(Schema.Number),
+  created: Schema.optional(Schema.Finite),
   durable: Schema.Struct({
     aggregateID: Schema.String,
     seq: Schema.Number,
@@ -90,27 +98,37 @@ const WireSynced = Schema.Struct({
   seq: Schema.optional(Schema.Number),
 })
 
-const decodeUtf8 = (bytes: Uint8Array) => new TextDecoder().decode(bytes, { stream: true })
+const WireFrame = Schema.Union([WireSynced, WireEvent], { mode: "oneOf" })
 
-// Split a byte stream into SSE `data:` payloads, buffering partial frames.
-const sseData = (bytes: Stream.Stream<Uint8Array>) =>
-  bytes.pipe(
-    Stream.map(decodeUtf8),
-    Stream.mapAccum("", (buffer, text) => {
-      const parts = (buffer + text).split("\n\n")
-      return [parts.pop() ?? "", parts]
+// SSE frames arrive as `data: <json>` lines split across arbitrary byte chunks.
+// One decoder per stream keeps partial multi-byte sequences intact, and the
+// accumulator holds the bytes of the frame that has not terminated yet.
+const sseData = <E>(bytes: Stream.Stream<Uint8Array, E>) => {
+  const decoder = new TextDecoder()
+  return bytes.pipe(
+    Stream.map((chunk) => decoder.decode(chunk, { stream: true }).replace(/\r\n/g, "\n")),
+    Stream.mapAccum(() => "", (buffer, text) => {
+      const frames = (buffer + text).split("\n\n")
+      const pending = frames.pop() ?? ""
+      const data = frames
+        .flatMap((frame) => frame.split("\n"))
+        .map((line) => (line.startsWith("data:") ? line.slice(5).trim() : ""))
+        .filter((payload) => payload.length > 0)
+      return [pending, data] as const
     }),
-    Stream.flatMap((frame) => Stream.fromIterable(frame.split("\n"))),
-    Stream.map((line) => (line.startsWith("data:") ? line.slice(5).trim() : "")),
-    Stream.filter((data) => data.length > 0),
   )
+}
+
+// Reconnect with exponential backoff capped at 30s per gap; `min` takes the
+// faster schedule so the cap applies per gap rather than in total.
+const retrySchedule = Schedule.min([Schedule.exponential("1 second"), Schedule.spaced("30 seconds")]).pipe(Schedule.jittered)
 
 const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
     const config = readConfig(process.env)
     if (!config) {
-      return Service.of({ status: Effect.succeed({ enabled: false, tailed: [] }) })
+      return Service.of({ status: () => Effect.succeed<Status>({ enabled: false, tailed: [] }) })
     }
 
     const bus = yield* Bus.Service
@@ -137,45 +155,37 @@ const layer = Layer.effect(
     })
 
     const replayFrame = Effect.fn("UpstreamSync.replayFrame")(function* (sessionID: string, data: string) {
-      const synced = Schema.decodeUnknownOption(WireSynced)(data)
-      if (Option.isSome(synced)) return
-      const event = yield* Schema.decodeUnknownEffect(WireEvent)(data).pipe(
-        Effect.catchAll(() => Effect.die(`UpstreamSync: undecodable log frame for ${sessionID}`)),
+      const frame = yield* Schema.decodeUnknownEffect(Schema.fromJsonString(WireFrame))(data).pipe(
+        Effect.catch(() =>
+          Effect.die(new UpstreamDivergedError({ sessionID, detail: `undecodable log frame: ${data.slice(0, 180)}` })),
+        ),
       )
-      // The session log endpoint is keyed by session; a foreign aggregate would
-      // corrupt the local mapping, so refuse it loudly.
-      if (event.durable.aggregateID !== sessionID) {
+      if (frame.type === "log.synced") return
+      // The log endpoint is keyed by session; a foreign aggregate would map the
+      // upstream transcript onto the wrong local session, so refuse it loudly.
+      if (frame.durable.aggregateID !== sessionID) {
         return yield* Effect.die(
-          `UpstreamSync: aggregate ${event.durable.aggregateID} streamed under session ${sessionID}`,
-        )
-      }
-      if (event.type === "session.deleted") return yield* Effect.interrupt
-      yield* bus
-        .replay(
-          {
-            id: Event.ID.make(event.id),
-            type: Event.versionedType(event.type, event.durable.version),
-            created: event.created ?? 0,
-            seq: event.durable.seq,
-            aggregateID: event.durable.aggregateID,
-            data: event.data,
-          },
-          { publish: true, ownerID, strictOwner: true },
-        )
-        .pipe(
-          Effect.catchAllCause((cause) => {
-            const detail = cause.reasons
-              .filter(Cause.isDieReason)
-              .map((reason) => (reason.defect instanceof Error ? reason.defect.message : String(reason.defect)))
-              .join("; ")
-            // A local replica that diverged or was claimed by another owner must
-            // stop following; silently skipping would corrupt the transcript.
-            if (detail.includes("diverged") || detail.includes("owner mismatch")) {
-              return Effect.die(new UpstreamDivergedError({ sessionID, detail }))
-            }
-            return Effect.logWarning(`UpstreamSync: skipped event for ${sessionID}: ${detail}`)
+          new UpstreamDivergedError({
+            sessionID,
+            detail: `aggregate ${frame.durable.aggregateID} streamed under session ${sessionID}`,
           }),
         )
+      }
+      if (frame.type === "session.deleted") {
+        tailed.delete(sessionID)
+        return yield* Effect.logInfo(`UpstreamSync: upstream session ${sessionID} deleted, stopped following`)
+      }
+      yield* bus.replay(
+        {
+          id: Event.ID.make(frame.id),
+          type: Event.versionedType(frame.type, frame.durable.version),
+          created: frame.created ?? 0,
+          seq: frame.durable.seq,
+          aggregateID: frame.durable.aggregateID,
+          data: frame.data,
+        },
+        { publish: true, ownerID, strictOwner: true },
+      )
     })
 
     const tailOnce = Effect.fn("UpstreamSync.tailOnce")(function* (sessionID: string) {
@@ -186,30 +196,31 @@ const layer = Layer.effect(
       if (response.status === 401 || response.status === 403) {
         return yield* new UpstreamAuthError({ status: response.status })
       }
-      if (response.status === 404) return yield* Effect.interrupt
+      if (response.status === 404) {
+        tailed.delete(sessionID)
+        return yield* Effect.logInfo(`UpstreamSync: upstream session ${sessionID} is gone`)
+      }
       yield* sseData(response.stream).pipe(Stream.runForEach((data) => replayFrame(sessionID, data)))
     })
 
+    // A rejected replay means the local replica can no longer be trusted against
+    // the upstream log: stop following it and surface the conflict instead of
+    // retrying into the same rejection. Anything else (network, 5xx) is retried.
     const tailForever = (sessionID: string) =>
       tailOnce(sessionID).pipe(
-        Effect.catchAllCause((cause) => {
-          const diverged = cause.reasons
-            .filter(Cause.isDieReason)
-            .map((reason) => reason.defect)
-            .find((defect) => defect instanceof UpstreamDivergedError)
-          if (diverged instanceof UpstreamDivergedError) {
-            const entry = tailed.get(sessionID)
-            if (entry) {
-              entry.state = "conflicted"
-              entry.detail = diverged.detail
-            }
-            return Effect.logError(`UpstreamSync: replica ${sessionID} conflicted: ${diverged.detail}`)
+        Effect.catchDefect((defect) => {
+          if (!(defect instanceof InvalidDurableEventError) && !(defect instanceof UpstreamDivergedError)) {
+            return Effect.die(defect)
           }
-          return Effect.failCause(cause)
+          const detail = defect.message
+          const entry = tailed.get(sessionID)
+          if (entry) {
+            entry.state = "conflicted"
+            entry.detail = detail
+          }
+          return Effect.logError(`UpstreamSync: replica ${sessionID} conflicted: ${detail}`)
         }),
-        Effect.retry(
-          Schedule.exponential("1 second", { factor: 2, maxInterval: "30 seconds" }).pipe(Schedule.jittered),
-        ),
+        Effect.retry(retrySchedule),
       )
 
     const discover = Effect.fn("UpstreamSync.discover")(function* () {
@@ -217,13 +228,13 @@ const layer = Layer.effect(
       for (const sessionID of sessions) {
         if (config.sessions && !config.sessions.includes(sessionID)) continue
         if (tailed.has(sessionID)) continue
-        const fiber = yield* tailForever(sessionID).pipe(Effect.forkScoped)
-        tailed.set(sessionID, { fiber, state: "following" })
+        tailed.set(sessionID, { state: "following" })
+        yield* tailForever(sessionID).pipe(Effect.forkScoped)
       }
     })
 
     yield* discover().pipe(
-      Effect.catchAllDefect((defect) => Effect.logWarning(`UpstreamSync: discovery pass failed: ${defect}`)),
+      Effect.catchCause((cause) => Effect.logWarning("UpstreamSync: discovery pass failed", { cause })),
       Effect.repeat(Schedule.spaced("10 seconds")),
       Effect.forkScoped,
     )
@@ -241,7 +252,7 @@ const layer = Layer.effect(
             }),
           { concurrency: 1 },
         )
-        return { enabled: true, peerID: config.peerID, tailed: entries }
+        return { enabled: true, peerID: config.peerID, tailed: entries } satisfies Status
       }),
     })
   }),
