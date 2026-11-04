@@ -12,6 +12,9 @@ concurrency:
   group: fork-build-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: write
+
 jobs:
   typecheck:
     runs-on: ubuntu-latest
@@ -44,3 +47,22 @@ jobs:
         with:
           name: opencode-linux-arm64-musl
           path: packages/cli/dist/cli-linux-arm64-musl/bin/opencode
+      # Workflow artifacts cannot be fetched without a token, but the Android
+      # pipeline downloads this binary by plain URL. A rolling prerelease asset
+      # is publicly downloadable, so publish the same file there.
+      - name: Publish rolling release asset
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: fork-sync-dev
+        run: |
+          ASSET=packages/cli/dist/cli-linux-arm64-musl/bin/opencode
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "AOpenCode fork build (upstream-sync)" \
+            --prerelease \
+            --notes "Rolling linux-arm64-musl opencode binary with the UpstreamSync module. Rebuilt on every push to upstream-sync; consumed by the Android app via OPENCODE_BINARY_URL." \
+            "$ASSET" 2>/dev/null \
+          || gh release upload "$TAG" "$ASSET" --repo "$GITHUB_REPOSITORY" --clobber
+      - name: Release URL
+        run: echo "https://github.com/${GITHUB_REPOSITORY}/releases/download/fork-sync-dev/opencode"
