@@ -50,6 +50,10 @@ jobs:
       # Workflow artifacts cannot be fetched without a token, but the Android
       # pipeline downloads this binary by plain URL. A rolling prerelease asset
       # is publicly downloadable, so publish the same file there.
+      #
+      # Order matters: the binary goes up first, then runtime.json. The manifest
+      # is what tells the app to download, so publishing it first would let a
+      # client chase a sha256 whose file is not there yet.
       - name: Publish rolling release asset
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -64,5 +68,24 @@ jobs:
             --notes "Rolling linux-arm64-musl opencode binary with the UpstreamSync module. Rebuilt on every push to upstream-sync; consumed by the Android app via OPENCODE_BINARY_URL." \
             "$ASSET" 2>/dev/null \
           || gh release upload "$TAG" "$ASSET" --repo "$GITHUB_REPOSITORY" --clobber
+
+          # The sha256 doubles as the runtime version. A rebuild that produces
+          # byte-identical output therefore does not ask any device to
+          # re-download 240 MB, which is the whole point of shipping the
+          # runtime out-of-band instead of inside the APK.
+          SHA="$(sha256sum "$ASSET" | awk '{print $1}')"
+          SIZE="$(stat -c%s "$ASSET")"
+          cat > "$RUNNER_TEMP/runtime.json" <<EOF
+          {
+            "sha256": "$SHA",
+            "size": $SIZE,
+            "url": "https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/opencode",
+            "builtAt": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          }
+          EOF
+          gh release upload "$TAG" "$RUNNER_TEMP/runtime.json" --repo "$GITHUB_REPOSITORY" --clobber
+          echo "runtime manifest: sha256=$SHA size=$SIZE"
       - name: Release URL
-        run: echo "https://github.com/${GITHUB_REPOSITORY}/releases/download/fork-sync-dev/opencode"
+        run: |
+          echo "https://github.com/${GITHUB_REPOSITORY}/releases/download/fork-sync-dev/opencode"
+          echo "https://github.com/${GITHUB_REPOSITORY}/releases/download/fork-sync-dev/runtime.json"
