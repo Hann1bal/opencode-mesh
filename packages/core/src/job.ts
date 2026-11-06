@@ -158,9 +158,26 @@ function matchesSession(job: Active, sessionID: SessionSchema.ID) {
   return job.recovery.sessionID === sessionID
 }
 
+/**
+ * HTTP layers and providers carry where the call went and how it failed as plain
+ * properties that the message alone drops, which is how a job dies reporting
+ * nothing but "Not Found". Surface them: the difference between "Not Found" and
+ * "Not Found [404 https://host/v1/chat/completions]" is the difference between
+ * guessing and knowing.
+ */
+function errorFields(error: Error) {
+  const record = error as unknown as Record<string, unknown>
+  const parts: string[] = []
+  if (typeof record._tag === "string" && record._tag !== error.name) parts.push(record._tag)
+  const status = record.statusCode ?? record.status
+  if (typeof status === "number") parts.push(String(status))
+  if (typeof record.url === "string") parts.push(record.url)
+  return parts.length === 0 ? "" : ` [${parts.join(" ")}]`
+}
+
 function errorText(cause: Cause.Cause<unknown>) {
   const render = (error: Error): string => {
-    const message = error.message || error.name || "Unknown error"
+    const message = `${error.message || error.name || "Unknown error"}${errorFields(error)}`
     if (!(error.cause instanceof Error)) return message
     const detail = render(error.cause)
     return detail === message || detail.startsWith(`${message}\n`) ? detail : `${message}\nCaused by: ${detail}`
