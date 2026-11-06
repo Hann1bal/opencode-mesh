@@ -174,6 +174,20 @@ export class AIError extends Schema.TaggedError<AIError>()("AI.Error", {
     return this.reason.http?.status
   }
 
+  /**
+   * Where the failed request was actually sent.
+   *
+   * HTTP failures carry it on `http`. Transport failures keep their own `url`,
+   * because a connect that never produced a response has no HttpContext to
+   * hang it on. Without this getter the URL exists on the reason but is
+   * unreachable through the wrapper, which is why a 404 from a provider
+   * arrives as a bare "Not Found" with no way to tell which path was called.
+   */
+  get url(): string | undefined {
+    if (this.reason._tag === "Transport") return this.reason.url ?? this.reason.http?.url
+    return this.reason.http?.url
+  }
+
   /** The provider's error code from the response body or `x-amzn-errortype`, or the transport's system error code. */
   get code(): string | undefined {
     if (this.reason._tag === "Transport" && this.reason.code !== undefined) return this.reason.code
